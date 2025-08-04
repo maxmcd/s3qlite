@@ -1,0 +1,15 @@
+#V2
+.open foo.db
+select * from users;
+CREATE TABLE employees (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT NOT NULL,\n    email TEXT UNIQUE,\n    department TEXT,\n    salary REAL,\n    hire_date DATE DEFAULT CURRENT_DATE\n);
+.open foo.db
+CREATE TABLE employees (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT NOT NULL,\n    email TEXT UNIQUE,\n    department TEXT,\n    salary REAL,\n    hire_date DATE DEFAULT CURRENT_DATE\n);\n
+.open foo.db
+CREATE TABLE employees (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT NOT NULL,\n    email TEXT UNIQUE,\n    department TEXT,\n    salary REAL,\n    hire_date DATE DEFAULT CURRENT_DATE\n);\n
+.open foo.db
+CREATE TABLE employees (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT NOT NULL,\n    email TEXT UNIQUE,\n    department TEXT,\n    salary REAL,\n    hire_date DATE DEFAULT CURRENT_DATE\n);\n
+.open foo.db
+CREATE TABLE employees (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT NOT NULL,\n    email TEXT UNIQUE,\n    department TEXT,\n    salary REAL,\n    hire_date DATE DEFAULT CURRENT_DATE\n);\n
+.open foo.db
+CREATE TABLE categories (\n    category_id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name VARCHAR(100) NOT NULL,\n    description TEXT\n);\n
+INSERT INTO categories (name, description) VALUES\n    ('Electronics', 'Electronic devices and accessories'),\n    ('Clothing', 'Apparel and fashion items'),\n    ('Books', 'Physical and digital books'),\n    ('Home & Garden', 'Home improvement and gardening supplies'),\n    ('Sports', 'Sports equipment and accessories');

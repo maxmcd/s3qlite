@@ -1,0 +1,19 @@
+[package]
+name = "s3qlite"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[features]
+static = ["sqlite-plugin/static"]
+dynamic = ["sqlite-plugin/dynamic"]
+
+[dependencies]
+sqlite-plugin = { path = "src/sqlite-plugin", features = ["dynamic", "static"] }
+tokio = { version = "1.45.1", features = ["full"] }
+log = { version = "0.4.27", features = ["std"] }
+parking_lot = "0.12.4"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "const_xxh3"] }
+slatedb = "0.7.0"
