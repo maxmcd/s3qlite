@@ -3,6 +3,8 @@ use rustyline::error::ReadlineError;
 use sqlite::{Connection, State};
 use std::process;
 
+mod main_test;
+
 unsafe extern "C" {
     fn initialize_grpsqlite() -> i32;
 }

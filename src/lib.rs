@@ -1,6 +1,8 @@
 use parking_lot::Mutex;
 use slatedb::object_store::{ObjectStore, memory::InMemory};
 use slatedb::{Db, WriteBatch};
+use sqlite_plugin::flags;
+use sqlite_plugin::vfs;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::{
@@ -8,7 +10,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Mutex as TokioMutex;
-
 mod handle;
 
 struct Capabilities {
@@ -72,7 +73,7 @@ impl GrpcVfs {
     }
 }
 
-impl sqlite_plugin::vfs::Vfs for GrpcVfs {
+impl vfs::Vfs for GrpcVfs {
     type Handle = handle::GrpcVfsHandle;
 
     fn register_logger(&self, logger: sqlite_plugin::logger::SqliteLogger) {
@@ -108,11 +109,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         }
     }
 
-    fn open(
-        &self,
-        path: Option<&str>,
-        opts: sqlite_plugin::flags::OpenOpts,
-    ) -> sqlite_plugin::vfs::VfsResult<Self::Handle> {
+    fn open(&self, path: Option<&str>, opts: flags::OpenOpts) -> vfs::VfsResult<Self::Handle> {
         let path = path.unwrap_or("");
         log::debug!("open: path={path}, opts={opts:?}");
         let mode = opts.mode();
@@ -136,7 +133,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         Ok(handle)
     }
 
-    fn delete(&self, path: &str) -> sqlite_plugin::vfs::VfsResult<()> {
+    fn delete(&self, path: &str) -> vfs::VfsResult<()> {
         log::debug!("delete: path={path}");
 
         self.runtime.block_on(async {
@@ -171,11 +168,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         Ok(())
     }
 
-    fn access(
-        &self,
-        path: &str,
-        flags: sqlite_plugin::flags::AccessFlags,
-    ) -> sqlite_plugin::vfs::VfsResult<bool> {
+    fn access(&self, path: &str, flags: flags::AccessFlags) -> vfs::VfsResult<bool> {
         let exists = self.runtime.block_on(async {
             let db = self.db.lock().await;
             db.get(&path).await.map_err(|e| {
@@ -188,7 +181,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         Ok(exists)
     }
 
-    fn file_size(&self, handle: &mut Self::Handle) -> sqlite_plugin::vfs::VfsResult<usize> {
+    fn file_size(&self, handle: &mut Self::Handle) -> vfs::VfsResult<usize> {
         let max_size = self.runtime.block_on(async {
             let db = self.db.lock().await;
 
@@ -220,11 +213,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         Ok(max_size)
     }
 
-    fn truncate(
-        &self,
-        handle: &mut Self::Handle,
-        size: usize,
-    ) -> sqlite_plugin::vfs::VfsResult<()> {
+    fn truncate(&self, handle: &mut Self::Handle, size: usize) -> vfs::VfsResult<()> {
         if size == 0 {
             self.delete(handle.path.as_str())?;
             return Ok(());
@@ -285,7 +274,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         handle: &mut Self::Handle,
         offset: usize,
         data: &[u8],
-    ) -> sqlite_plugin::vfs::VfsResult<usize> {
+    ) -> vfs::VfsResult<usize> {
         log::debug!("write: path={}, offset={}", handle.path, offset,);
 
         // Get or create file state
@@ -355,7 +344,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         handle: &mut Self::Handle,
         offset: usize,
         data: &mut [u8],
-    ) -> sqlite_plugin::vfs::VfsResult<usize> {
+    ) -> vfs::VfsResult<usize> {
         // Read from the server
         let result = self.runtime.block_on(async {
             let db = self.db.lock().await;
@@ -396,14 +385,14 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         Ok(len)
     }
 
-    fn close(&self, handle: Self::Handle) -> sqlite_plugin::vfs::VfsResult<()> {
+    fn close(&self, handle: Self::Handle) -> vfs::VfsResult<()> {
         self.files.lock().remove(&handle.path);
         Ok(())
     }
 
     fn device_characteristics(&self) -> i32 {
         log::debug!("device_characteristics");
-        let mut characteristics: i32 = sqlite_plugin::vfs::DEFAULT_DEVICE_CHARACTERISTICS;
+        let mut characteristics: i32 = vfs::DEFAULT_DEVICE_CHARACTERISTICS;
 
         if self.capabilities.atomic_batch {
             log::debug!("enabling SQLITE_IOCAP_BATCH_ATOMIC");
@@ -418,8 +407,8 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
     fn pragma(
         &self,
         handle: &mut Self::Handle,
-        pragma: sqlite_plugin::vfs::Pragma<'_>,
-    ) -> Result<Option<String>, sqlite_plugin::vfs::PragmaErr> {
+        pragma: vfs::Pragma<'_>,
+    ) -> Result<Option<String>, vfs::PragmaErr> {
         log::debug!("pragma: file={:?}, pragma={:?}", handle.path, pragma);
         if pragma.name == "is_memory_server" {
             return Ok(Some("maybe?".to_string()));
@@ -432,7 +421,7 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         handle: &mut Self::Handle,
         op: c_int,
         _p_arg: *mut c_void,
-    ) -> sqlite_plugin::vfs::VfsResult<()> {
+    ) -> vfs::VfsResult<()> {
         log::debug!("file_control: file={:?}, op={:?}", handle.path, op);
         match op {
             sqlite_plugin::vars::SQLITE_FCNTL_BEGIN_ATOMIC_WRITE => {
@@ -558,12 +547,12 @@ impl sqlite_plugin::vfs::Vfs for GrpcVfs {
         self.capabilities.sector_size
     }
 
-    fn unlock(
-        &self,
-        handle: &mut Self::Handle,
-        _level: sqlite_plugin::flags::LockLevel,
-    ) -> sqlite_plugin::vfs::VfsResult<()> {
-        log::debug!("unlock: path={}", handle.path);
+    fn unlock(&self, handle: &mut Self::Handle, level: flags::LockLevel) -> vfs::VfsResult<()> {
+        log::debug!("unlock: path={} level={level:?}", handle.path);
+        Ok(())
+    }
+    fn lock(&self, handle: &mut Self::Handle, level: flags::LockLevel) -> vfs::VfsResult<()> {
+        log::debug!("lock: path={} level={level:?}", handle.path);
         Ok(())
     }
 }
@@ -580,10 +569,10 @@ const VFS_NAME: &CStr = c"grpsqlite";
 pub unsafe extern "C" fn initialize_grpsqlite() -> i32 {
     let vfs = GrpcVfs::new();
 
-    if let Err(err) = sqlite_plugin::vfs::register_static(
+    if let Err(err) = vfs::register_static(
         VFS_NAME.to_owned(),
         vfs,
-        sqlite_plugin::vfs::RegisterOpts { make_default: true },
+        vfs::RegisterOpts { make_default: true },
     ) {
         eprintln!("Failed to initialize grpsqlite: {err}");
         return err;
@@ -608,11 +597,11 @@ pub unsafe extern "C" fn sqlite3_grpsqlite_init(
 ) -> std::os::raw::c_int {
     let vfs = GrpcVfs::new();
     if let Err(err) = unsafe {
-        sqlite_plugin::vfs::register_dynamic(
+        vfs::register_dynamic(
             p_api,
             VFS_NAME.to_owned(),
             vfs,
-            sqlite_plugin::vfs::RegisterOpts { make_default: true },
+            vfs::RegisterOpts { make_default: true },
         )
     } {
         return err;
