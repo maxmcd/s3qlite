@@ -1,3 +1,7 @@
 /target
 sqlite
 *.dylib
+*.so
+*.a
+*.o
+*.cpuprofile

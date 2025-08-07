@@ -8,8 +8,21 @@ edition = "2024"
 name = "repl"
 path = "src/main.rs"
 
+[features]
+default = ["static"]
+static = []
+dynamic = []
+
 [dependencies]
 sqlite = { version = "0.36.1", default-features = false }
 rustyline = "14.0"
 
 [workspace]
+
+
+[profile.release]
+debug = true
+strip = false
+
+[profile.dev]
+debug = true

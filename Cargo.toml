@@ -17,3 +17,14 @@ log = { version = "0.4.27", features = ["std"] }
 parking_lot = "0.12.4"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "const_xxh3"] }
 slatedb = "0.7.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
+tracing-chrome = "0.7"
+
+
+[profile.release]
+debug = true
+strip = false
+
+[profile.dev]
+debug = true

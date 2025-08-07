@@ -28,7 +28,7 @@ impl SqliteRepl {
         if let Ok(mut stmt) = connection.prepare("PRAGMA is_memory_server") {
             if let Ok(State::Row) = stmt.next() {
                 if let Ok(result) = stmt.read::<String, _>(0) {
-                    println!("result: {}", result);
+                    println!("result: {result}");
                     vfs_detected = result == "maybe?";
                 }
             }
