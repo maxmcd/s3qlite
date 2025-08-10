@@ -1,19 +1,21 @@
 use parking_lot::Mutex;
+use slatedb::bytes::Bytes;
 use slatedb::config::{PutOptions, WriteOptions};
 use slatedb::object_store::{ObjectStore, memory::InMemory};
-use slatedb::{Db, WriteBatch};
+use slatedb::{Db, Settings, WriteBatch};
 use sqlite_plugin::flags;
 use sqlite_plugin::vfs;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tracing::instrument;
+use tracing::{Level, instrument, span};
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::{Registry, layer::SubscriberExt};
 mod handle;
+mod lock_manager;
 
 #[derive(Clone)]
 struct Capabilities {
@@ -48,7 +50,9 @@ struct GrpcVfs {
     capabilities: Capabilities,
     db: Arc<Db>,
     files: Arc<Mutex<HashMap<String, FileState>>>,
-    _guard: Arc<Mutex<tracing_chrome::FlushGuard>>,
+    _guard: Arc<Mutex<Option<tracing_chrome::FlushGuard>>>,
+    handle_counter: Arc<AtomicU64>,
+    lock_manager: lock_manager::LockManager,
 }
 
 const PAGE_SIZE: usize = 4096;
@@ -63,7 +67,11 @@ impl GrpcVfs {
 
         let db = runtime.block_on(async {
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            Db::open("test_db", object_store).await.unwrap()
+            Db::builder("test_db", object_store)
+                .with_settings(Settings::default())
+                .build()
+                .await
+                .unwrap()
         });
         let guard = setup_tracing();
 
@@ -76,8 +84,91 @@ impl GrpcVfs {
                 point_in_time_reads: false,
                 sector_size: 4096,
             },
-            _guard: Arc::new(Mutex::new(guard)),
+            _guard: Arc::new(Mutex::new(Some(guard))),
+            handle_counter: Arc::new(AtomicU64::new(1)),
+            lock_manager: lock_manager::LockManager::new(),
         }
+    }
+
+    fn block_on<F, T>(&self, future: F) -> Result<T, i32>
+    where
+        F: std::future::Future<Output = Result<T, i32>>,
+    {
+        let span = span!(Level::INFO, "block_on");
+        let _guard = span.enter();
+        self.runtime.block_on(future)
+    }
+
+    pub async fn put<K, V>(&self, key: K, value: V) -> Result<(), i32>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let span = span!(Level::INFO, "put");
+        let _guard = span.enter();
+        self.db
+            .put_with_options(
+                key,
+                value,
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|e| {
+                log::error!("error putting page: {e}");
+                sqlite_plugin::vars::SQLITE_IOERR_WRITE
+            })
+    }
+
+    pub async fn delete<K>(&self, key: K) -> Result<(), i32>
+    where
+        K: AsRef<[u8]>,
+    {
+        let span = span!(Level::INFO, "delete");
+        let _guard = span.enter();
+        self.db
+            .delete_with_options(
+                key,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|e| {
+                log::error!("error deleting page: {e}");
+                sqlite_plugin::vars::SQLITE_IOERR_DELETE
+            })
+    }
+    pub async fn db_write(&self, batch: WriteBatch) -> Result<(), i32> {
+        let span = span!(Level::INFO, "db_write");
+        let _guard = span.enter();
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|e| {
+                log::error!("error writing page: {e}");
+                sqlite_plugin::vars::SQLITE_IOERR_WRITE
+            })
+    }
+
+
+    pub async fn get<K>(&self, key: K) -> Result<Option<Bytes>, i32>
+    where
+        K: AsRef<[u8]> + Send,
+    {
+        let span = span!(Level::INFO, "get");
+        let _guard = span.enter();
+        self.db.get(key).await.map_err(|e| {
+            log::error!("error getting page: {e}");
+            sqlite_plugin::vars::SQLITE_IOERR_READ
+        })
     }
 }
 
@@ -109,7 +200,9 @@ impl vfs::Vfs for GrpcVfs {
                 self.logger.lock().log(level, msg.as_bytes());
             }
 
-            fn flush(&self) {}
+            fn flush(&self) {
+                println!("flush");
+            }
         }
 
         let log = LogCompat {
@@ -121,7 +214,7 @@ impl vfs::Vfs for GrpcVfs {
         }
     }
 
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip(self, path, opts))]
     fn open(&self, path: Option<&str>, opts: flags::OpenOpts) -> vfs::VfsResult<Self::Handle> {
         let path = path.unwrap_or("");
         log::debug!("open: path={path}, opts={opts:?}");
@@ -133,25 +226,11 @@ impl vfs::Vfs for GrpcVfs {
         }
 
         if !path.is_empty() {
-            self.runtime.block_on(async {
-                let db = self.db.clone();
-                db.put_with_options(
-                    &path,
-                    &[],
-                    &PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    log::error!("error putting page key: {e}");
-                    sqlite_plugin::vars::SQLITE_IOERR_DELETE
-                })
-            })?;
+            self.block_on(async { self.put(&path, &[]).await })?;
         }
 
-        let handle = handle::GrpcVfsHandle::new(path.to_string(), mode.is_readonly());
+        let handle_id = self.handle_counter.fetch_add(1, Ordering::SeqCst);
+        let handle = handle::GrpcVfsHandle::new(path.to_string(), mode.is_readonly(), handle_id);
         Ok(handle)
     }
 
@@ -159,71 +238,37 @@ impl vfs::Vfs for GrpcVfs {
     fn delete(&self, path: &str) -> vfs::VfsResult<()> {
         log::debug!("delete: path={path}");
 
-        self.runtime.block_on(async {
-            let db = self.db.clone();
-
+        self.block_on(async {
             // Delete all pages for this file
             let mut page_offset = 0;
             loop {
                 let page_key = format!("{path}:page:{page_offset}");
-                let exists = db.get(&page_key).await.map_err(|e| {
-                    log::error!("error getting page key: {e}");
-                    sqlite_plugin::vars::SQLITE_IOERR_DELETE
-                })?;
+                let exists = self.get(&page_key).await?;
 
                 if exists.is_some() {
-                    db.delete_with_options(
-                        &page_key,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|e| {
-                        log::error!("error deleting page key: {e}");
-                        sqlite_plugin::vars::SQLITE_IOERR_DELETE
-                    })?;
+                    self.delete(&page_key).await?;
                     page_offset += PAGE_SIZE;
                 } else {
                     break;
                 }
             }
-            db.delete_with_options(
-                &path,
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|e| {
-                log::error!("error deleting file: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_DELETE
-            })?;
+            self.delete(&path).await?;
             Ok::<(), i32>(())
         })?;
 
         Ok(())
     }
 
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip(self, path, flags))]
     fn access(&self, path: &str, flags: flags::AccessFlags) -> vfs::VfsResult<bool> {
-        let exists = self.runtime.block_on(async {
-            let db = self.db.clone();
-            db.get(&path).await.map_err(|e| {
-                log::error!("error getting page key: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_ACCESS
-            })
-        })?;
-        let exists = exists.is_some();
+        let exists = self.block_on(async { self.get(path).await })?.is_some();
         log::debug!("access: path={path}, flags={flags:?}, exists={exists}");
         Ok(exists)
     }
 
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip(self, handle))]
     fn file_size(&self, handle: &mut Self::Handle) -> vfs::VfsResult<usize> {
-        let max_size = self.runtime.block_on(async {
-            let db = self.db.clone();
-
+        let max_size = self.block_on(async {
             // Find the highest page offset for this file to calculate total size
             // This is a simplified approach - in a real implementation you might want to
             // track file metadata separately for better performance
@@ -233,10 +278,7 @@ impl vfs::Vfs for GrpcVfs {
             let mut page_offset = 0;
             loop {
                 let page_key = format!("{}:page:{}", handle.path, page_offset);
-                let page_data = db.get(&page_key).await.map_err(|e| {
-                    log::error!("error getting page key: {e}");
-                    sqlite_plugin::vars::SQLITE_IOERR_FSTAT
-                })?;
+                let page_data = self.get(&page_key).await?;
 
                 if let Some(page) = page_data {
                     max_size = page_offset + page.len();
@@ -252,43 +294,27 @@ impl vfs::Vfs for GrpcVfs {
         Ok(max_size)
     }
 
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip(self, handle, size))]
     fn truncate(&self, handle: &mut Self::Handle, size: usize) -> vfs::VfsResult<()> {
         if size == 0 {
-            self.delete(handle.path.as_str())?;
+            self.block_on(async { self.delete(handle.path.as_str()).await })?;
             return Ok(());
         }
 
-        self.runtime.block_on(async {
-            let db = self.db.clone();
+        self.block_on(async {
             // Calculate which page contains the truncation point
             let truncate_page_offset = (size / PAGE_SIZE) * PAGE_SIZE;
             let truncate_offset_in_page = size % PAGE_SIZE;
 
             // Truncate the page that contains the truncation point
             let page_key = format!("{}:page:{}", handle.path, truncate_page_offset);
-            let page_data = db.get(&page_key).await.map_err(|e| {
-                log::error!("error getting page during truncate: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_TRUNCATE
-            })?;
+            let page_data = self.get(&page_key).await?;
 
             if let Some(page) = page_data {
                 let mut page_vec = page.clone();
                 if truncate_offset_in_page < page_vec.len() {
                     page_vec.truncate(truncate_offset_in_page);
-                    db.put_with_options(
-                        &page_key,
-                        page_vec,
-                        &PutOptions::default(),
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|e| {
-                        log::error!("error putting truncated page: {e}");
-                        sqlite_plugin::vars::SQLITE_IOERR_TRUNCATE
-                    })?;
+                    self.put(&page_key, page_vec).await?;
                 }
             }
 
@@ -296,23 +322,10 @@ impl vfs::Vfs for GrpcVfs {
             let mut page_offset = truncate_page_offset + PAGE_SIZE;
             loop {
                 let page_key = format!("{}:page:{}", handle.path, page_offset);
-                let exists = db.get(&page_key).await.map_err(|e| {
-                    log::error!("error checking page existence during truncate: {e}");
-                    sqlite_plugin::vars::SQLITE_IOERR_TRUNCATE
-                })?;
+                let exists = self.get(&page_key).await?;
 
                 if exists.is_some() {
-                    db.delete_with_options(
-                        &page_key,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|e| {
-                        log::error!("error deleting page during truncate: {e}");
-                        sqlite_plugin::vars::SQLITE_IOERR_TRUNCATE
-                    })?;
+                    self.delete(&page_key).await?;
                     page_offset += PAGE_SIZE;
                 } else {
                     break;
@@ -325,13 +338,15 @@ impl vfs::Vfs for GrpcVfs {
         Ok(())
     }
 
-    #[instrument(level = "info", skip(self, data))]
     fn write(
         &self,
         handle: &mut Self::Handle,
         offset: usize,
         data: &[u8],
     ) -> vfs::VfsResult<usize> {
+        let span = span!(Level::INFO, "write");
+        let _guard = span.enter();
+
         // Get or create file state
         let file_state = {
             let mut files = self.files.lock();
@@ -353,20 +368,17 @@ impl vfs::Vfs for GrpcVfs {
                 offset,
                 data: data.to_vec(),
             });
+            span.record("pending_writes", pending_writes.len());
             return Ok(data.len());
         }
 
         // Write over the server
-        self.runtime.block_on(async {
-            let db = self.db.clone();
+        self.block_on(async move {
             let page_offset = (offset / PAGE_SIZE) * PAGE_SIZE;
             let page_key = format!("{}:page:{}", handle.path, page_offset);
 
             // Get existing page data
-            let existing_page = db.get(&page_key).await.map_err(|e| {
-                log::error!("error getting page during write: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_WRITE
-            })?;
+            let existing_page = self.get(&page_key).await?;
 
             let mut page_data = if let Some(existing) = existing_page {
                 existing.to_vec()
@@ -389,19 +401,7 @@ impl vfs::Vfs for GrpcVfs {
             );
             page_data[offset_in_page..offset_in_page + data.len()].copy_from_slice(data);
 
-            db.put_with_options(
-                &page_key,
-                page_data,
-                &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|e| {
-                log::error!("error putting page during write: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_WRITE
-            })
+            self.put(&page_key, page_data).await
         })?;
         Ok(data.len())
     }
@@ -414,20 +414,16 @@ impl vfs::Vfs for GrpcVfs {
         data: &mut [u8],
     ) -> vfs::VfsResult<usize> {
         // Read from the server
-        let result = self.runtime.block_on(async {
-            let db = self.db.clone();
+        self.block_on(async move {
             // Calculate the page key using integer division
             let page_offset = (offset / PAGE_SIZE) * PAGE_SIZE;
             let page_key = format!("{}:page:{}", handle.path, page_offset);
 
-            let page_data = db.get(&page_key).await.map_err(|e| {
-                log::error!("error getting page during read: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_READ
-            })?;
+            let page_data = self.get(&page_key).await?;
 
             if page_data.is_none() {
                 println!("read page not found, returning empty data");
-                return Ok::<Vec<u8>, i32>(vec![]);
+                return Ok::<usize, i32>(0);
             }
 
             let page = page_data.unwrap();
@@ -436,30 +432,36 @@ impl vfs::Vfs for GrpcVfs {
             // Check if offset is beyond page size
             if offset_in_page >= page.len() {
                 println!("read offset is beyond page size");
-                return Ok(vec![]);
+                return Ok(0);
             }
 
             // Read as much data as available from this page, up to the requested length
             let end_offset_in_page = std::cmp::min(offset_in_page + data.len(), page.len());
-            let data = page[offset_in_page..end_offset_in_page].to_vec();
+            let d = page[offset_in_page..end_offset_in_page].to_vec();
 
             println!("read data length: {} from page {}", data.len(), page_offset);
 
-            Ok(data)
-        })?;
-
-        let len = data.len().min(result.len());
-        data[..len].copy_from_slice(&result[..len]);
-        Ok(len)
+            let len = data.len().min(d.len());
+            data[..len].copy_from_slice(&d[..len]);
+            Ok(len)
+        })
     }
 
     #[instrument(level = "info", skip(self))]
     fn close(&self, handle: Self::Handle) -> vfs::VfsResult<()> {
-        self.files.lock().remove(&handle.path);
+        log::debug!("close: path={} handle_id={}", handle.path, handle.handle_id);
+
+        // Remove handle from lock manager
+        self.lock_manager.remove_handle(&handle.path, handle.handle_id);
+
+        // Clean up file state if needed (keep for batch writes)
+        // Note: We keep file states around for batch operations, lock manager handles its own cleanup
 
         // Flush traces on every close to ensure data is written
         let guard = self._guard.lock();
-        guard.flush();
+        if let Some(guard) = &*guard {
+            guard.flush();
+        }
 
         Ok(())
     }
@@ -486,6 +488,7 @@ impl vfs::Vfs for GrpcVfs {
         Ok(None)
     }
 
+    #[instrument(level = "info", skip(self, handle, op, _p_arg))]
     fn file_control(
         &self,
         handle: &mut Self::Handle,
@@ -530,7 +533,7 @@ impl vfs::Vfs for GrpcVfs {
                 file_state.batch_open.store(false, Ordering::Release);
 
                 // Send the batch over the server
-                self.runtime.block_on(async {
+                self.block_on(async {
                     let batch = {
                         let mut pending = file_state.pending_writes.lock();
                         std::mem::take(&mut *pending)
@@ -593,17 +596,7 @@ impl vfs::Vfs for GrpcVfs {
                     }
 
                     // Execute all page updates atomically
-                    db.write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|e| {
-                        log::error!("error writing batch: {e}");
-                        sqlite_plugin::vars::SQLITE_IOERR_WRITE
-                    })
+                    self.db_write(batch).await
                 })?;
 
                 Ok(())
@@ -631,24 +624,24 @@ impl vfs::Vfs for GrpcVfs {
         self.capabilities.sector_size
     }
 
+    #[instrument(level = "info", skip(self))]
     fn unlock(&self, handle: &mut Self::Handle, level: flags::LockLevel) -> vfs::VfsResult<()> {
-        log::debug!("unlock: path={} level={level:?}", handle.path);
-        Ok(())
+        self.lock_manager.unlock(&handle.path, handle.handle_id, level)
     }
+    #[instrument(level = "info", skip(self))]
     fn lock(&self, handle: &mut Self::Handle, level: flags::LockLevel) -> vfs::VfsResult<()> {
-        log::debug!("lock: path={} level={level:?}", handle.path);
-        Ok(())
+        self.lock_manager.lock(&handle.path, handle.handle_id, level)
     }
     #[instrument(level = "info", skip(self))]
     fn sync(&self, handle: &mut Self::Handle) -> vfs::VfsResult<()> {
         log::debug!("sync: path={}", handle.path);
-        self.runtime.block_on(async {
-            let db = self.db.clone();
-            db.flush().await.map_err(|e| {
-                log::error!("error flushing database: {e}");
-                sqlite_plugin::vars::SQLITE_IOERR_FSYNC
-            })
-        })?;
+        // self.runtime.block_on(async {
+        //     let db = self.db.clone();
+        //     db.flush().await.map_err(|e| {
+        //         log::error!("error flushing database: {e}");
+        //         sqlite_plugin::vars::SQLITE_IOERR_FSYNC
+        //     })
+        // })?;
         Ok(())
     }
 }
@@ -683,15 +676,6 @@ fn setup_tracing() -> tracing_chrome::FlushGuard {
     guard
 }
 
-impl Drop for GrpcVfs {
-    fn drop(&mut self) {
-        // Flush traces when VFS is dropped
-        let guard = self._guard.lock();
-        guard.flush();
-        println!("Flushed traces");
-    }
-}
-
 /// This function initializes the VFS statically.
 /// Called automatically when the library is loaded.
 ///
@@ -714,6 +698,16 @@ pub unsafe extern "C" fn initialize_grpsqlite() -> i32 {
     // set the log level to trace
     log::set_max_level(log::LevelFilter::Trace);
     sqlite_plugin::vars::SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flush_traces() {
+    let vfs = get_grpc_vfs();
+    let guard = vfs._guard.lock().take();
+    if let Some(guard) = guard {
+        guard.flush();
+        drop(guard);
+    }
 }
 
 /// This function is called by `SQLite` when the extension is loaded. It registers

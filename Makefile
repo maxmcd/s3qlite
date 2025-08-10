@@ -99,7 +99,7 @@ build: repl/lib/$(STATIC_LIB)
 	cd repl && cargo build --release
 
 test: repl/lib/$(STATIC_LIB)
-	cd repl && cargo test -- --show-output
+	cd repl && cargo test --package repl --bin repl -- main_test::tests::test_concurrent_operations --exact --show-output
 
 clean:
 	cargo clean

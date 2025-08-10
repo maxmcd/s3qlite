@@ -4,6 +4,7 @@ mod tests {
 
     unsafe extern "C" {
         fn initialize_grpsqlite() -> i32;
+        fn flush_traces();
     }
 
     fn init_vfs() {
@@ -19,6 +20,7 @@ mod tests {
         connection
             .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -44,6 +46,7 @@ mod tests {
 
         let mut stmt = connection.prepare("SELECT name FROM users WHERE id = 1")?;
         assert_eq!(stmt.next()?, State::Row);
+        unsafe { flush_traces() };
         Ok(())
     }
 
@@ -111,6 +114,7 @@ mod tests {
             );
         }
 
+        unsafe { flush_traces() };
         Ok(())
     }
 
@@ -191,6 +195,7 @@ mod tests {
         assert_eq!(stmt.next().unwrap(), State::Row);
         let name: String = stmt.read(0).unwrap();
         assert_eq!(name, "Alice");
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -214,6 +219,7 @@ mod tests {
         assert_eq!(stmt.next().unwrap(), State::Row);
         let count: i64 = stmt.read(0).unwrap();
         assert_eq!(count, 3);
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -244,6 +250,7 @@ mod tests {
         let title: String = stmt.read(1).unwrap();
         assert_eq!(name, "Alice");
         assert_eq!(title, "Hello World");
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -267,6 +274,7 @@ mod tests {
         assert_eq!(stmt.next().unwrap(), State::Row);
         let count: i64 = stmt.read(0).unwrap();
         assert_eq!(count, 2);
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -290,6 +298,7 @@ mod tests {
         assert_eq!(stmt.next().unwrap(), State::Row);
         let email: String = stmt.read(0).unwrap();
         assert_eq!(email, "alice@new.com");
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -314,6 +323,7 @@ mod tests {
         assert_eq!(stmt.next().unwrap(), State::Row);
         let count: i64 = stmt.read(0).unwrap();
         assert_eq!(count, 1);
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -349,6 +359,7 @@ mod tests {
         let count: i64 = stmt.read(1).unwrap();
         assert_eq!(name, "Alice");
         assert_eq!(count, 2);
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -370,6 +381,7 @@ mod tests {
         let length: i64 = stmt.read(1).unwrap();
         assert_eq!(upper_name, "ALICE");
         assert_eq!(length, 5);
+        unsafe { flush_traces() };
     }
 
     #[test]
@@ -385,5 +397,6 @@ mod tests {
         } else {
             panic!("grpsqlite VFS not detected");
         }
+        unsafe { flush_traces() };
     }
 }
